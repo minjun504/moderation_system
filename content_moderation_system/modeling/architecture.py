@@ -13,9 +13,9 @@ class TierOneFilter(nn.Module):
 
 
 class DistilBertRegressor(nn.Module):
-    def __init__(self, dropout_rate=0.3):
+    def __init__(self, model_name="distilbert-base-uncased", dropout_rate=0.3):
         super().__init__()
-        self.distilbert = DistilBertModel.from_pretrained("distilbert-base-uncased")
+        self.distilbert = DistilBertModel.from_pretrained(model_name)
         self.dropout = nn.Dropout(dropout_rate)
         self.regressor = nn.Linear(in_features=768, out_features=1)
     
