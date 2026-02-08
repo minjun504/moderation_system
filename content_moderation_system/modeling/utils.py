@@ -1,6 +1,15 @@
 import torch
-import optuna
+import numpy as np
 from architecture import TierOneFilter, DistilBertRegressor
+from optimum.onnxruntime import ORTModelForFeatureExtraction
+from transformers import AutoTokenizer
+
+def csr_to_tensor(X):
+    coo = X.tocoo()
+    coords = torch.from_numpy(np.vstack((coo.row, coo.col)).astype(np.int64))
+    vals = torch.from_numpy(coo.data.astype(np.float32))
+    shape = torch.Size(coo.shape)
+    return torch.sparse_coo_tensor(coords, vals, shape)
 
 def train_one_epoch(model, loader, optimizer, loss_fxn, device):
     model.train()
@@ -31,11 +40,6 @@ def validate(model, loader, loss_fxn, device):
     return total_loss / len(loader)
 
 def collate_dense(batch):
-    """
-    Custom collator for SieveData.
-    Input: List of dicts [{'x': sparse_tensor, 'target': tensor}, ...]
-    Output: Dict {'x': dense_batch, 'target': target_batch}
-    """
     xs = [item["x"] for item in batch]
     targets = [item["target"] for item in batch]
     
@@ -46,3 +50,30 @@ def collate_dense(batch):
         "x": torch.stack(xs),
         "target": torch.stack(targets)
     }
+
+def get_embeddings(text_list, encoder_path, batch_size=32):
+    model = ORTModelForFeatureExtraction.from_pretrained(encoder_path, file_name="model_quantized.onnx")
+    tokenizer = AutoTokenizer.from_pretrained(encoder_path)
+    
+    all_embeddings = []
+    
+    for i in range(0, len(text_list), batch_size):
+        batch_texts = text_list[i : i + batch_size]
+        
+        inputs = tokenizer(
+            batch_texts, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True, 
+            max_length=128
+        )
+        
+        with torch.no_grad():
+            outputs = model(**inputs)
+        
+        cls_vectors = outputs.last_hidden_state[:, 0, :].detach()
+        all_embeddings.append(cls_vectors)
+        
+        del inputs, outputs, cls_vectors
+
+    return torch.cat(all_embeddings, dim=0)

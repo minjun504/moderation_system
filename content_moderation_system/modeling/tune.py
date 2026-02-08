@@ -1,22 +1,26 @@
 import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.data import TensorDataset
 import optuna
 import json
+import gc
 
-from content_moderation_system.features import build_vectoriser, csr_to_tensor
-from content_moderation_system.config import PROCESSED_DATA_DIR, CONFIG_DIR
-from content_moderation_system.modeling.torch_dataset import SieveData, BertDataset
+from content_moderation_system.config import PROCESSED_DATA_DIR, CONFIG_DIR, MODELS_DIR
+from content_moderation_system.modeling.torch_dataset import VectorDataset
 from content_moderation_system.modeling.architecture import TierOneFilter, DistilBertRegressor
-from content_moderation_system.modeling.utils import train_one_epoch, validate, collate_dense
+from content_moderation_system.modeling.utils import csr_to_tensor, train_one_epoch, validate, get_embeddings, collate_dense
 
 def objective(trial,
-              model_type, 
-              df_train, 
-              df_test, 
-              input_feature, 
-              target_feature, 
+              model_type=None, 
+              df_train=None, 
+              df_test=None, 
+              encoded_train=None, 
+              encoded_test=None, 
+              input_feature="comment_text", 
+              target_feature="target", 
               batch_size: int = 32, 
               random_seed: int = 42
 ):
@@ -29,7 +33,10 @@ def objective(trial,
     y_train = df_train[target_feature].values
     y_test = df_test[target_feature].values
 
-    threshold = 0.5
+    y_train_tensor = torch.tensor(y_train).float()
+    y_test_tensor = torch.tensor(y_test).float()
+
+    threshold = trial.suggest_float("imbalance_threshold", 0.1, 0.9)
     binary_labels = torch.tensor(y_train >= threshold).float()
     num_pos = binary_labels.sum()
     num_neg = len(binary_labels) - num_pos
@@ -45,34 +52,31 @@ def objective(trial,
             ngram_range = (1, 2)
         max_features = trial.suggest_int("max_features", 5000, 20000)
 
-        vectorizer = build_vectoriser(ngram_range=ngram_range, max_features=max_features)
+        vectorizer = TfidfVectorizer(ngram_range=ngram_range, max_features=max_features)
         X_train = vectorizer.fit_transform(X_train)
         X_test = vectorizer.transform(X_test)
         X_train = csr_to_tensor(X_train)
         X_test = csr_to_tensor(X_test)
 
-        train_dataset = SieveData(X_train, torch.tensor(y_train).float())
-        test_dataset = SieveData(X_test, torch.tensor(y_test).float())
+        train_dataset = VectorDataset(X_train, y_train_tensor)
+        test_dataset = VectorDataset(X_test, y_test_tensor)
         model = TierOneFilter(vocab_size=len(vectorizer.get_feature_names_out())).to(device)
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_dense)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_dense)
-
     
     elif model_type == "BERT":
         dropout_rate = trial.suggest_float("dropout_rate", 0.1, 0.5)
-        train_dataset = BertDataset(X_train.tolist(), y_train)
-        test_dataset = BertDataset(X_test.tolist(), y_test)
 
+        train_dataset = VectorDataset(encoded_train, y_train_tensor)
+        test_dataset = VectorDataset(encoded_test, y_test_tensor)
         model = DistilBertRegressor(dropout_rate=dropout_rate).to(device)
     
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
 
-
     loss_fxn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.Adam(params=model.parameters(), lr=lr)
-
 
     epochs = 5
     for epoch in range(epochs):
@@ -94,11 +98,42 @@ def run_study(
 ):
     study = optuna.create_study(direction="minimize")
 
-    study.optimize(
-        lambda trial: objective(trial, model_type, df_train, df_test, input_feature, target_feature), 
-        n_trials = n_trials
-    )
-    return study.best_params
+    if model_type == "sieve":
+        study.optimize(
+            lambda trial: objective(
+                trial, "sieve",
+                df_train=df_train, 
+                df_test=df_test, 
+                input_feature=input_feature, 
+                target_feature=target_feature
+            ), 
+            n_trials=n_trials
+        )
+
+    if model_type == "BERT":
+        encoder_path = MODELS_DIR / "quantized_encoder"
+        
+        train_texts = df_train[input_feature].tolist()
+        embeddings_train = get_embeddings(train_texts, encoder_path).half()
+        del train_texts
+
+        test_texts = df_test[input_feature].tolist()
+        embeddings_test = get_embeddings(test_texts, encoder_path).half()
+        del test_texts
+        gc.collect()
+
+        study.optimize(
+                    lambda trial: objective(
+                        trial, model_type="BERT", 
+                        df_train=df_train, df_test=df_test, 
+                        encoded_train=embeddings_train, 
+                        encoded_test=embeddings_test,
+                        input_feature=input_feature, 
+                        target_feature=target_feature
+                    ), 
+                    n_trials=n_trials
+                )
+        return study.best_params
 
 if __name__ == "__main__":
     TRAIN_PATH = PROCESSED_DATA_DIR/"processed_train.csv"
@@ -113,7 +148,7 @@ if __name__ == "__main__":
     df_test = pd.read_csv(TEST_PATH).sample(frac=0.1, random_state=42)
 
     results = {}
-    results["sieve"] = run_study("sieve", df_train, df_test, INPUT_FEATURE, TARGET_FEATURE, 20)
+    results["sieve"] = run_study("sieve", df_train.copy(), df_test.copy(), INPUT_FEATURE, TARGET_FEATURE, 20)
     results["BERT"] = run_study("BERT", df_train, df_test, INPUT_FEATURE, TARGET_FEATURE, 20)
 
     with open(OUTPUT_PATH, "w") as f:
