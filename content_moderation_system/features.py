@@ -8,4 +8,3 @@ def csr_to_tensor(X):
     vals = torch.from_numpy(coo.data.astype(np.float32))
     shape = torch.Size(coo.shape)
     return torch.sparse_coo_tensor(coords, vals, shape)
-

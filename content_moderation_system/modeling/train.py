@@ -4,11 +4,12 @@ import torch.nn as nn
 import json
 import joblib
 from torch.utils.data import DataLoader, TensorDataset
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 from content_moderation_system.config import PROCESSED_DATA_DIR, CONFIG_DIR, MODELS_DIR
-from content_moderation_system.features import build_vectoriser, csr_to_tensor
+from content_moderation_system.features import csr_to_tensor
 from content_moderation_system.modeling.architecture import TierOneFilter, DistilBertRegressor
-from content_moderation_system.modeling.torch_dataset import SieveData
+from content_moderation_system.modeling.torch_dataset import VectorDataset
 from content_moderation_system.modeling.utils import train_one_epoch, get_embeddings, collate_dense
 
 def load_best_params():
@@ -24,20 +25,19 @@ def train_tier_one(df_train, params, device):
     y_train = torch.tensor(df_train["target"].values).float().unsqueeze(1).to(device)
 
     ngram = tuple(map(int, params["ngram_range"].split(","))) if isinstance(params["ngram_range"], str) else params["ngram_range"]
-    vectorizer = build_vectoriser(
+    vectorizer = TfidfVectorizer(
         ngram_range=ngram, 
         max_features=params["max_features"]
     )
     X_vec = vectorizer.fit_transform(X_text)
     
     joblib.dump(vectorizer, MODELS_DIR / "tier1_vectorizer.pkl")
-    print("Vectorizer saved.")
 
     vocab_size = len(vectorizer.get_feature_names_out())
     model = TierOneFilter(vocab_size=vocab_size).to(device)
     
     X_tensor = csr_to_tensor(X_vec)
-    dataset = SieveData(X_tensor, y_train.cpu()) 
+    dataset = VectorDataset(X_tensor, y_train.cpu()) 
     loader = DataLoader(dataset, batch_size=64, shuffle=True, collate_fn=collate_dense)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=params["lr"])
@@ -49,7 +49,6 @@ def train_tier_one(df_train, params, device):
         print(f"Epoch {epoch+1}: Loss = {avg_loss:.4f}")
 
     torch.save(model.state_dict(), MODELS_DIR / "tier1_model.pt")
-    print("Tier 1 Model saved.")
 
 def train_tier_two(df_train, params, device):    
     texts = df_train["comment_text"].tolist()
@@ -60,7 +59,7 @@ def train_tier_two(df_train, params, device):
 
     model = DistilBertRegressor(dropout_rate=params["dropout_rate"]).to(device)
 
-    dataset = TensorDataset(embeddings.cpu(), y_train.cpu())
+    dataset = VectorDataset(embeddings.cpu(), y_train.cpu())
     loader = DataLoader(dataset, batch_size=32, shuffle=True)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=params["lr"])
@@ -72,27 +71,18 @@ def train_tier_two(df_train, params, device):
         print(f"Epoch {epoch+1}: Loss = {avg_loss:.4f}")
 
     torch.save(model.state_dict(), MODELS_DIR / "tier2_head.pt")
-    print("Tier 2 Head saved.")
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Load ALL data (Prod training uses full dataset, not sample)
-    print("Loading Data...")
     df_train = pd.read_csv(PROCESSED_DATA_DIR / "processed_train.csv")
     
-    # Safety Check for RAM: If dataset > 50k rows, you might want to sample 
-    # or implement stricter batching. For now, we assume it fits.
-    # df_train = df_train.sample(50000) # Optional limit
-
     best_params = load_best_params()
 
-    # Train Tier 1
     if "sieve" in best_params:
         train_tier_one(df_train, best_params["sieve"], device)
     
-    # Train Tier 2
     if "BERT" in best_params:
         train_tier_two(df_train, best_params["BERT"], device)
         
